@@ -199,6 +199,29 @@ class WritePackageResponse(BaseModel):
     data: WritePackageData
 
 
+class PageTelemetry(BaseModel):
+    pageNo: int
+    stage1Model: str
+    stage2Model: str
+    durationMs: int | None = None
+
+
+class PageResultData(BaseModel):
+    schemaVersion: str = "ocr-page-result.v1"
+    caseId: str
+    docType: DocType
+    docVersionId: str
+    pageNo: int
+    ocrPageUpsert: OcrPageWrite
+    pageExtractionUpsert: PageExtractionWrite
+    telemetry: PageTelemetry
+
+
+class PageResultResponse(BaseModel):
+    ok: bool
+    data: PageResultData
+
+
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(
@@ -207,6 +230,61 @@ def health() -> HealthResponse:
         ollama_base_url=settings.ollama_base_url,
         ollama_stage1_model=settings.ollama_stage1_model,
         ollama_stage2_model=settings.ollama_stage2_model,
+    )
+
+
+@app.post("/v1/ocr/extract-page-image", response_model=PageResultResponse)
+async def extract_page_image(
+    caseId: str = Query(..., min_length=1),
+    docType: DocType = Query(...),
+    docVersionId: str = Query(..., min_length=1),
+    pageNo: int = Query(..., ge=1),
+    file: UploadFile = File(...),
+    dpi: int = Query(settings.default_dpi, ge=120, le=400),
+    num_ctx: int = Query(settings.default_num_ctx, ge=2048, le=65536),
+    num_predict: int = Query(settings.default_num_predict, ge=512, le=8192),
+    temperature_stage1: float = Query(settings.default_temperature_stage1, ge=0.0, le=1.0),
+    temperature_stage2: float = Query(settings.default_temperature_stage2, ge=0.0, le=1.0),
+    enable_stage2: bool = Query(True),
+) -> PageResultResponse:
+    validate_image_upload(file)
+
+    image_bytes = await file.read()
+    started_at = now_iso()
+    started_monotonic = datetime.now(timezone.utc)
+    page_write, page_extraction = process_page_image(
+        case_id=caseId,
+        doc_type=docType,
+        doc_version_id=docVersionId,
+        page_no=pageNo,
+        image_bytes=image_bytes,
+        image_key=f"{caseId}/{docVersionId}/page-{pageNo}.{resolve_image_extension(file)}",
+        started_at=started_at,
+        num_ctx=num_ctx,
+        num_predict=num_predict,
+        temperature_stage1=temperature_stage1,
+        temperature_stage2=temperature_stage2,
+        enable_stage2=enable_stage2,
+    )
+
+    elapsed_ms = int((datetime.now(timezone.utc) - started_monotonic).total_seconds() * 1000)
+
+    return PageResultResponse(
+        ok=True,
+        data=PageResultData(
+            caseId=caseId,
+            docType=docType,
+            docVersionId=docVersionId,
+            pageNo=pageNo,
+            ocrPageUpsert=page_write,
+            pageExtractionUpsert=page_extraction,
+            telemetry=PageTelemetry(
+                pageNo=pageNo,
+                stage1Model=settings.ollama_stage1_model,
+                stage2Model=settings.ollama_stage2_model if enable_stage2 else settings.ollama_stage1_model,
+                durationMs=elapsed_ms,
+            ),
+        ),
     )
 
 
@@ -229,7 +307,7 @@ async def extract_upload_pdf(
 ) -> WritePackageResponse:
     validate_upload(file)
 
-    temp_dir = Path(tempfile.gettempdir()) / "contract-ocr-service"
+    temp_dir = Path(tempfile.gettempdir()) / "contract-ocr-microservice"
     temp_dir.mkdir(parents=True, exist_ok=True)
     temp_pdf_path = temp_dir / f"{uuid.uuid4()}.pdf"
 
@@ -247,93 +325,22 @@ async def extract_upload_pdf(
         for page_no in range(start_page, resolved_end_page + 1):
             image_bytes = render_pdf_page_to_jpeg_bytes(temp_pdf_path, page_no - 1, dpi=dpi)
             image_key = f"{caseId}/{docVersionId}/page-{page_no}.jpg"
-
-            try:
-                md_raw = call_ollama_chat_image(
-                    image_bytes=image_bytes,
-                    model=settings.ollama_stage1_model,
-                    prompt=STAGE1_OCR_PROMPT,
-                    num_ctx=num_ctx,
-                    num_predict=num_predict,
-                    temperature=temperature_stage1,
-                )
-
-                md_norm = md_raw
-                if enable_stage2:
-                    md_norm = call_ollama_chat_text(
-                        input_text=md_raw,
-                        model=settings.ollama_stage2_model,
-                        prompt=STAGE2_NORMALIZE_PROMPT,
-                        num_ctx=num_ctx,
-                        num_predict=num_predict,
-                        temperature=temperature_stage2,
-                    )
-
-                canonical_text = normalize_markdown(md_norm)
-                hallucination_flags = detect_hallucination_flags(canonical_text)
-                hallucination_score = min(1.0, round(len(hallucination_flags) * 0.15, 2))
-
-                ocr_pages.append(
-                    OcrPageWrite(
-                        caseId=caseId,
-                        docType=docType,
-                        docVersionId=docVersionId,
-                        pageNo=page_no,
-                        ocrStatus=OcrPageStatus.READY,
-                        ocrRunStartedAt=started,
-                        textStage1Raw=md_raw,
-                        textStage2Normalized=md_norm,
-                        textSystem=canonical_text,
-                        imageKey=image_key,
-                        hallucinationScore=hallucination_score,
-                        hallucinationFlags=hallucination_flags,
-                    )
-                )
-
-                page_extractions.append(
-                    PageExtractionWrite(
-                        caseId=caseId,
-                        docType=docType,
-                        docVersionId=docVersionId,
-                        pageNo=page_no,
-                        data=extract_page_data(canonical_text, page_no),
-                        parserMeta={
-                            "extractorVersion": "v1",
-                            "source": "ollama-microservice",
-                            "normalized": enable_stage2,
-                        },
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001
-                ocr_pages.append(
-                    OcrPageWrite(
-                        caseId=caseId,
-                        docType=docType,
-                        docVersionId=docVersionId,
-                        pageNo=page_no,
-                        ocrStatus=OcrPageStatus.FAILED,
-                        ocrRunStartedAt=started,
-                        textStage1Raw="",
-                        textStage2Normalized="",
-                        textSystem="",
-                        imageKey=image_key,
-                        reviewStatus=OcrReviewStatus.NEEDS_REVIEW,
-                        reviewReason="OCR failed",
-                        hallucinationScore=1.0,
-                        hallucinationFlags=["OCR_FAILED"],
-                        lastError=str(exc),
-                    )
-                )
-                page_extractions.append(
-                    PageExtractionWrite(
-                        caseId=caseId,
-                        docType=docType,
-                        docVersionId=docVersionId,
-                        pageNo=page_no,
-                        data={"entities": [], "snippets": [], "warnings": ["OCR_FAILED"]},
-                        parserMeta={"extractorVersion": "v1", "source": "ollama-microservice", "error": str(exc)},
-                    )
-                )
+            page_write, page_extraction = process_page_image(
+                case_id=caseId,
+                doc_type=docType,
+                doc_version_id=docVersionId,
+                page_no=page_no,
+                image_bytes=image_bytes,
+                image_key=image_key,
+                started_at=started,
+                num_ctx=num_ctx,
+                num_predict=num_predict,
+                temperature_stage1=temperature_stage1,
+                temperature_stage2=temperature_stage2,
+                enable_stage2=enable_stage2,
+            )
+            ocr_pages.append(page_write)
+            page_extractions.append(page_extraction)
 
         doc_extraction = build_doc_extraction(caseId, docType, docVersionId, ocr_pages)
         screening = None
@@ -396,6 +403,25 @@ def validate_upload(file: UploadFile) -> None:
         raise HTTPException(status_code=400, detail=f"content-type ไม่รองรับ: {content_type}")
 
 
+def validate_image_upload(file: UploadFile) -> None:
+    filename = (file.filename or "").lower()
+    content_type = (file.content_type or "").lower()
+
+    if not (filename.endswith(".png") or filename.endswith(".jpg") or filename.endswith(".jpeg")):
+        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ภาพ .png/.jpg/.jpeg")
+
+    if content_type and content_type not in {"image/png", "image/jpeg", "image/jpg", "application/octet-stream"}:
+        raise HTTPException(status_code=400, detail=f"content-type ไม่รองรับ: {content_type}")
+
+
+def resolve_image_extension(file: UploadFile) -> str:
+    filename = (file.filename or "").lower()
+    if filename.endswith(".jpg") or filename.endswith(".jpeg"):
+        return "jpg"
+
+    return "png"
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -418,6 +444,104 @@ def render_pdf_page_to_jpeg_bytes(pdf_path: Path, page_index: int, dpi: int) -> 
         return pixmap.tobytes("jpeg")
     finally:
         doc.close()
+
+
+def process_page_image(
+    *,
+    case_id: str,
+    doc_type: DocType,
+    doc_version_id: str,
+    page_no: int,
+    image_bytes: bytes,
+    image_key: str,
+    started_at: str,
+    num_ctx: int,
+    num_predict: int,
+    temperature_stage1: float,
+    temperature_stage2: float,
+    enable_stage2: bool,
+) -> tuple[OcrPageWrite, PageExtractionWrite]:
+    try:
+        md_raw = call_ollama_chat_image(
+            image_bytes=image_bytes,
+            model=settings.ollama_stage1_model,
+            prompt=STAGE1_OCR_PROMPT,
+            num_ctx=num_ctx,
+            num_predict=num_predict,
+            temperature=temperature_stage1,
+        )
+
+        md_norm = md_raw
+        if enable_stage2:
+            md_norm = call_ollama_chat_text(
+                input_text=md_raw,
+                model=settings.ollama_stage2_model,
+                prompt=STAGE2_NORMALIZE_PROMPT,
+                num_ctx=num_ctx,
+                num_predict=num_predict,
+                temperature=temperature_stage2,
+            )
+
+        canonical_text = normalize_markdown(md_norm)
+        hallucination_flags = detect_hallucination_flags(canonical_text)
+        hallucination_score = min(1.0, round(len(hallucination_flags) * 0.15, 2))
+
+        return (
+            OcrPageWrite(
+                caseId=case_id,
+                docType=doc_type,
+                docVersionId=doc_version_id,
+                pageNo=page_no,
+                ocrStatus=OcrPageStatus.READY,
+                ocrRunStartedAt=started_at,
+                textStage1Raw=md_raw,
+                textStage2Normalized=md_norm,
+                textSystem=canonical_text,
+                imageKey=image_key,
+                hallucinationScore=hallucination_score,
+                hallucinationFlags=hallucination_flags,
+            ),
+            PageExtractionWrite(
+                caseId=case_id,
+                docType=doc_type,
+                docVersionId=doc_version_id,
+                pageNo=page_no,
+                data=extract_page_data(canonical_text, page_no),
+                parserMeta={
+                    "extractorVersion": "v1",
+                    "source": "ollama-microservice",
+                    "normalized": enable_stage2,
+                },
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return (
+            OcrPageWrite(
+                caseId=case_id,
+                docType=doc_type,
+                docVersionId=doc_version_id,
+                pageNo=page_no,
+                ocrStatus=OcrPageStatus.FAILED,
+                ocrRunStartedAt=started_at,
+                textStage1Raw="",
+                textStage2Normalized="",
+                textSystem="",
+                imageKey=image_key,
+                reviewStatus=OcrReviewStatus.NEEDS_REVIEW,
+                reviewReason="OCR failed",
+                hallucinationScore=1.0,
+                hallucinationFlags=["OCR_FAILED"],
+                lastError=str(exc),
+            ),
+            PageExtractionWrite(
+                caseId=case_id,
+                docType=doc_type,
+                docVersionId=doc_version_id,
+                pageNo=page_no,
+                data={"entities": [], "snippets": [], "warnings": ["OCR_FAILED"]},
+                parserMeta={"extractorVersion": "v1", "source": "ollama-microservice", "error": str(exc)},
+            ),
+        )
 
 
 def call_ollama_chat_image(
